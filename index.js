@@ -17,6 +17,12 @@ try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
         // Priority 1: JSON String content (Best for Render/Heroku)
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+
+        // Critical Fix: Replace literal \n with actual newlines if they were escaped
+        if (serviceAccount.private_key) {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+        }
+
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
