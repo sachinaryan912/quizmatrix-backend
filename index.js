@@ -41,6 +41,11 @@ try {
     console.warn("Firebase Admin Initialization Warning:", error.message);
 }
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 let db;
 try {
     db = admin.firestore();
