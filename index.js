@@ -3,12 +3,20 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const admin = require('firebase-admin');
+const paypal = require('@paypal/checkout-server-sdk');
+const logger = require('./logger'); // [NEW] Import Logger
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// [NEW] Request Logging Middleware
+app.use((req, res, next) => {
+    logger.info(`Incoming Request: ${req.method} ${req.url} - IP: ${req.ip}`);
+    next();
+});
 
 // Initialize Firebase Admin
 // NOTE: You need to set GOOGLE_APPLICATION_CREDENTIALS or manually initialize with service account
@@ -36,9 +44,9 @@ try {
         // Priority 3: Default (Google Cloud/Firebase Hosting environment)
         admin.initializeApp();
     }
-    console.log("Firebase Admin Initialized");
+    logger.info("Firebase Admin Initialized");
 } catch (error) {
-    console.warn("Firebase Admin Initialization Warning:", error.message);
+    logger.warn(`Firebase Admin Initialization Warning: ${error.message}`);
 }
 
 // Health check endpoint
@@ -50,7 +58,7 @@ let db;
 try {
     db = admin.firestore();
 } catch (error) {
-    console.error("Error initializing Firestore:", error.message);
+    logger.error(`Error initializing Firestore: ${error.message}`);
 }
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -61,6 +69,7 @@ app.post('/api/explain-exam', async (req, res) => {
         const { examId, examTitle, questions } = req.body;
 
         if (!examId || !questions || !Array.isArray(questions)) {
+            logger.warn('Invalid request data for explain-exam');
             return res.status(400).json({ error: "Invalid request data" });
         }
 
@@ -69,11 +78,11 @@ app.post('/api/explain-exam', async (req, res) => {
         const docSnap = await explanationRef.get();
 
         if (docSnap.exists) {
-            console.log(`[Cache Hit] Serving explanations for exam: ${examId}`);
+            logger.info(`[Cache Hit] Serving explanations for exam: ${examId}`);
             return res.json({ explanations: docSnap.data().explanations });
         }
 
-        console.log(`[Cache Miss] Generating AI explanations for exam: ${examId} (${questions.length} questions)`);
+        logger.info(`[Cache Miss] Generating AI explanations for exam: ${examId} (${questions.length} questions)`);
 
         // 2. Prepare Bulk Prompt for Gemini
         // Model rotation logic
@@ -104,7 +113,7 @@ app.post('/api/explain-exam', async (req, res) => {
 
         for (const modelName of models) {
             try {
-                console.log(`Trying model: ${modelName}...`);
+                logger.info(`Trying model: ${modelName}...`);
                 const model = genAI.getGenerativeModel({ model: modelName });
                 const result = await model.generateContent(prompt);
                 const response = await result.response;
@@ -114,10 +123,10 @@ app.post('/api/explain-exam', async (req, res) => {
                 text = text.replace(/```json/g, '').replace(/```/g, '').trim();
 
                 explanations = JSON.parse(text);
-                console.log(`Success with model: ${modelName}`);
+                logger.info(`Success with model: ${modelName}`);
                 break; // Exit loop on success
             } catch (error) {
-                console.warn(`Failed with model ${modelName}:`, error.message);
+                logger.warn(`Failed with model ${modelName}: ${error.message}`);
                 lastError = error;
                 // Continue to next model
             }
@@ -138,11 +147,86 @@ app.post('/api/explain-exam', async (req, res) => {
         res.json({ explanations });
 
     } catch (error) {
-        console.error("Error generating explanations:", error);
+        logger.error(`Error generating explanations: ${error.stack}`);
         res.status(500).json({ error: "Failed to generate explanations", details: error.message });
     }
 });
 
+// PayPal Configuration
+const environment = () => {
+    const clientId = process.env.PAYPAL_CLIENT_ID;
+    const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+
+    if (process.env.NODE_ENV === 'production') {
+        return new paypal.core.LiveEnvironment(clientId, clientSecret);
+    }
+    // Default to Sandbox
+    return new paypal.core.SandboxEnvironment(clientId, clientSecret);
+};
+
+const paypalClient = () => {
+    return new paypal.core.PayPalHttpClient(environment());
+};
+
+// PayPal Endpoints
+app.post('/api/paypal/create-order', async (req, res) => {
+    try {
+        const { amount, currency } = req.body;
+
+        if (!amount) {
+            logger.warn('PayPal Create Order Failed: Missing Amount');
+            return res.status(400).json({ error: "Amount is required" });
+        }
+
+        const request = new paypal.orders.OrdersCreateRequest();
+        request.prefer("return=representation");
+        request.requestBody({
+            intent: 'CAPTURE',
+            purchase_units: [{
+                amount: {
+                    currency_code: currency || 'USD',
+                    value: amount.toString()
+                }
+            }]
+        });
+
+        const order = await paypalClient().execute(request);
+        logger.info(`PayPal Order Created: ${order.result.id} (${amount} ${currency || 'USD'})`);
+        res.json({ id: order.result.id });
+    } catch (e) {
+        logger.error(`PayPal Create Order Error: ${e.message}`);
+        res.status(500).json({ error: "Failed to create PayPal order: " + e.message });
+    }
+});
+
+app.post('/api/paypal/capture-order', async (req, res) => {
+    try {
+        const { orderID } = req.body;
+
+        if (!orderID) {
+            logger.warn('PayPal Capture Failed: Missing OrderID');
+            return res.status(400).json({ error: "Order ID is required" });
+        }
+
+        const request = new paypal.orders.OrdersCaptureRequest(orderID);
+        request.requestBody({});
+
+        const capture = await paypalClient().execute(request);
+
+        logger.info(`PayPal Payment Captured: ${capture.result.id} by ${capture.result.payer.name.given_name}`);
+
+        // Return minimal necessary data
+        res.json({
+            status: capture.result.status,
+            id: capture.result.id,
+            payer: capture.result.payer
+        });
+    } catch (e) {
+        logger.error(`PayPal Capture Order Error: ${e.message}`);
+        res.status(500).json({ error: "Failed to capture PayPal order: " + e.message });
+    }
+});
+
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    logger.info(`Server running on port ${PORT}`);
 });
